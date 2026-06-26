@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
   push:
     paths:
-      - '.github/workflows/build-repo-index.yml'
+      - 'RUN_REGISTER_ANALYSIS.txt'
 
 permissions:
   contents: write
@@ -17,20 +17,18 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 1
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install openpyxl
-      - name: Build index and full registers analysis
+
+      - name: Build full registers analysis
         shell: bash
         run: |
           set -e
-          rm -rf REPO_INDEX REPO_ANALYSIS_FULL
-          mkdir -p REPO_INDEX REPO_ANALYSIS_FULL
-          find . -type f ! -path './.git/*' ! -path './REPO_INDEX/*' ! -path './REPO_ANALYSIS/*' ! -path './REPO_ANALYSIS_FULL/*' | sed 's#^./##' | sort > /tmp/repo_files.txt
-          split -l 1000 -d -a 4 /tmp/repo_files.txt REPO_INDEX/files_
-          for f in REPO_INDEX/files_*; do mv "$f" "$f.txt"; done
-          { echo '# CONFIG_AUDIT_INDEX'; echo; echo "Сформировано: $(date -u +'%F %T UTC')"; echo "Всего файлов: $(wc -l < /tmp/repo_files.txt)"; echo; cut -d/ -f1 /tmp/repo_files.txt | sort | uniq -c | sort -nr; } > REPO_INDEX/SUMMARY.txt
+          rm -rf REPO_ANALYSIS_FULL
+          mkdir -p REPO_ANALYSIS_FULL
           python <<'PY'
           from pathlib import Path
           import xml.etree.ElementTree as ET
@@ -41,143 +39,281 @@ jobs:
           from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
           from openpyxl.utils import get_column_letter
           from openpyxl.worksheet.table import Table, TableStyleInfo
-          OUT=Path('REPO_ANALYSIS_FULL'); OUT.mkdir(exist_ok=True)
-          def clean(x): return '' if x is None else ' '.join(str(x).replace('\ufeff','').split())
-          def ln(t): return t.split('}',1)[-1] if '}' in t else t
-          def ch(p,n):
-            if p is None: return None
-            for c in p:
-              if ln(c.tag)==n: return c
-            return None
-          def txt(p,n):
-            c=ch(p,n)
-            return clean(c.text) if c is not None else ''
-          def syn(p):
-            s=ch(p,'Synonym'); r=[]
-            if s is not None:
-              for e in s.iter():
-                if ln(e.tag)=='content' and e.text: r.append(clean(e.text))
-            return '; '.join(r)
-          def ttip(p):
-            s=ch(p,'ToolTip'); r=[]
-            if s is not None:
-              for e in s.iter():
-                if ln(e.tag)=='content' and e.text: r.append(clean(e.text))
-            return '; '.join(r)
-          def typ(p):
-            s=ch(p,'Type'); r=[]
-            if s is not None:
-              for e in s.iter():
-                if ln(e.tag) in ('Type','TypeSet') and e.text: r.append(clean(e.text))
-            return '; '.join(dict.fromkeys(r))
-          def props(o): return ch(o,'Properties')
-          def items(o,name):
-            co=ch(o,'ChildObjects'); out=[]
-            if co is None: return out
-            for it in co:
-              if ln(it.tag)==name:
-                p=props(it); out.append({'n':txt(p,'Name'),'s':syn(p),'t':typ(p),'tip':ttip(p),'tot':txt(p,'UseInTotals'),'fill':txt(p,'FillChecking')})
-            return out
-          def bf(a,lim=8):
-            r=[]
-            for x in a[:lim]:
-              v=x['n']
-              if x.get('s') and x['s']!=x['n']: v+=f" ({x['s']})"
-              r.append(v)
-            if len(a)>lim: r.append(f'… +{len(a)-lim}')
-            return ', '.join(r)
-          def contour(n,s,d,r,a):
-            q=' '.join([n,s]+[x['n'] for x in d+r+a]).lower()
-            rules=[('Склад / товарные остатки',['склад','товар','номенклатур','остат','запас','ячейк','помещен','серии','серия','партии','партия','отбор','отгруз','поступлен','упаков']),('Заказы / резервы / обеспечение',['заказ','резерв','потребност','обеспеч','распоряж','к поступлению','к отгрузке']),('Продажи / клиенты',['продаж','реализац','клиент','выруч','розниц','чек','комисси','подароч','бонус']),('Закупки / поставщики',['закуп','поставщик','поступлен','поставок','импорт']),('Денежные средства / казначейство',['денеж','деньг','банк','касс','эквайр','платеж','оплат','подотчет','сбп']),('Взаиморасчеты',['расчет','задолж','аванс','контрагент','партнер','договор','долг','срок']),('НДС / налоги / регл. учет',['ндс','налог','акциз','книги покупок','книги продаж','прослеж','егаис','ветис']),('Себестоимость / финрезультат / расходы',['себестоим','стоимост','финансов','доход','расход','затрат','прибыл','выруч']),('Цены / скидки / условия',['цен','скид','нацен','прайс','соглашен','услов']),('Производство / работы',['производ','выпуск','материал','работ','комплект','сборк','разборк']),('Интеграции / обмены / ЭДО',['обмен','синхрон','эдо','сообщен','архив','идентификатор','интеграц','ветис','егаис','гисм']),('Администрирование / настройки / служебные данные',['настрой','статус','состояни','пользователь','верси','параметр','безопас','блокиров','сеанс','лог','доступ','роль','хранилищ'])]
-            for c,ks in rules:
-              if any(k in q for k in ks): return c
-            return 'Прочее / требуется ручное уточнение'
-          def kind(ot,rt,per,wm):
-            if ot=='Регистр накопления': return 'Остатки' if rt=='Balance' else ('Обороты' if rt=='Turnovers' else (rt or 'тип не указан'))
-            p='Периодические сведения' if per and per not in ('Nonperiodical','Nonperiodic') else 'Непериодические сведения'
-            if wm=='Independent': return p+'; независимая запись'
-            if wm=='RecorderSubmission': return p+'; подчинен регистратору'
-            return p+(('; '+wm) if wm else '')
-          rows=[]; names=set(); field_rows=[]
-          for folder,ot,tag in [('AccumulationRegisters','Регистр накопления','AccumulationRegister'),('InformationRegisters','Регистр сведений','InformationRegister')]:
-            for path in sorted(Path(folder).glob('*.xml')):
-              n=path.stem
+
+          OUT = Path('REPO_ANALYSIS_FULL')
+          OUT.mkdir(exist_ok=True)
+
+          def clean(x):
+              return '' if x is None else ' '.join(str(x).replace('\ufeff', '').split())
+
+          def lname(tag):
+              return tag.split('}', 1)[-1] if '}' in tag else tag
+
+          def child(parent, name):
+              if parent is None:
+                  return None
+              for item in parent:
+                  if lname(item.tag) == name:
+                      return item
+              return None
+
+          def text(parent, name):
+              item = child(parent, name)
+              return clean(item.text) if item is not None else ''
+
+          def props(obj):
+              return child(obj, 'Properties')
+
+          def synonym(p):
+              node = child(p, 'Synonym')
+              vals = []
+              if node is not None:
+                  for e in node.iter():
+                      if lname(e.tag) == 'content' and e.text:
+                          vals.append(clean(e.text))
+              return '; '.join(vals)
+
+          def tooltip(p):
+              node = child(p, 'ToolTip')
+              vals = []
+              if node is not None:
+                  for e in node.iter():
+                      if lname(e.tag) == 'content' and e.text:
+                          vals.append(clean(e.text))
+              return '; '.join(vals)
+
+          def type_text(p):
+              node = child(p, 'Type')
+              vals = []
+              if node is not None:
+                  for e in node.iter():
+                      if lname(e.tag) in ('Type', 'TypeSet') and e.text:
+                          vals.append(clean(e.text))
+              return '; '.join(dict.fromkeys(vals))
+
+          def items(obj, tag_name):
+              co = child(obj, 'ChildObjects')
+              out = []
+              if co is None:
+                  return out
+              for item in co:
+                  if lname(item.tag) == tag_name:
+                      p = props(item)
+                      out.append({
+                          'name': text(p, 'Name'),
+                          'synonym': synonym(p),
+                          'type': type_text(p),
+                          'tooltip': tooltip(p),
+                          'fill': text(p, 'FillChecking'),
+                          'totals': text(p, 'UseInTotals'),
+                      })
+              return out
+
+          def brief(arr, limit=8):
+              vals = []
+              for x in arr[:limit]:
+                  v = x['name']
+                  if x.get('synonym') and x['synonym'] != x['name']:
+                      v += ' (' + x['synonym'] + ')'
+                  vals.append(v)
+              if len(arr) > limit:
+                  vals.append('… +' + str(len(arr) - limit))
+              return ', '.join(vals)
+
+          def contour(name, syn, dims, res, attrs):
+              q = ' '.join([name, syn] + [x['name'] for x in dims + res + attrs]).lower()
+              rules = [
+                  ('Склад / товарные остатки', ['склад','товар','номенклатур','остат','запас','ячейк','помещен','серии','серия','партии','партия','отбор','отгруз','поступлен','упаков']),
+                  ('Заказы / резервы / обеспечение', ['заказ','резерв','потребност','обеспеч','распоряж','к поступлению','к отгрузке']),
+                  ('Продажи / клиенты', ['продаж','реализац','клиент','выруч','розниц','чек','комисси','подароч','бонус']),
+                  ('Закупки / поставщики', ['закуп','поставщик','поступлен','поставок','импорт']),
+                  ('Денежные средства / казначейство', ['денеж','деньг','банк','касс','эквайр','платеж','оплат','подотчет','сбп']),
+                  ('Взаиморасчеты', ['расчет','задолж','аванс','контрагент','партнер','договор','долг','срок']),
+                  ('НДС / налоги / регл. учет', ['ндс','налог','акциз','книги покупок','книги продаж','прослеж','егаис','ветис']),
+                  ('Себестоимость / финрезультат / расходы', ['себестоим','стоимост','финансов','доход','расход','затрат','прибыл','выруч']),
+                  ('Цены / скидки / условия', ['цен','скид','нацен','прайс','соглашен','услов']),
+                  ('Производство / работы', ['производ','выпуск','материал','работ','комплект','сборк','разборк']),
+                  ('Интеграции / обмены / ЭДО', ['обмен','синхрон','эдо','сообщен','архив','идентификатор','интеграц','ветис','егаис','гисм']),
+                  ('Администрирование / настройки / служебные данные', ['настрой','статус','состояни','пользователь','верси','параметр','безопас','блокиров','сеанс','лог','доступ','роль','хранилищ']),
+              ]
+              for cat, keys in rules:
+                  if any(k in q for k in keys):
+                      return cat
+              return 'Прочее / требуется ручное уточнение'
+
+          def storage_kind(obj_type, register_type, periodicity, write_mode):
+              if obj_type == 'Регистр накопления':
+                  if register_type == 'Balance':
+                      return 'Остатки'
+                  if register_type == 'Turnovers':
+                      return 'Обороты'
+                  return register_type or 'тип не указан'
+              base = 'Периодические сведения' if periodicity and periodicity not in ('Nonperiodical', 'Nonperiodic') else 'Непериодические сведения'
+              if write_mode == 'Independent':
+                  return base + '; независимая запись'
+              if write_mode == 'RecorderSubmission':
+                  return base + '; подчинен регистратору'
+              return base + (('; ' + write_mode) if write_mode else '')
+
+          rows = []
+          field_rows = []
+          names = set()
+          for folder, obj_type, root_tag in [('AccumulationRegisters', 'Регистр накопления', 'AccumulationRegister'), ('InformationRegisters', 'Регистр сведений', 'InformationRegister')]:
+              for path in sorted(Path(folder).glob('*.xml')):
+                  name = path.stem
+                  try:
+                      root = ET.parse(path).getroot()
+                      obj = None
+                      for e in root.iter():
+                          if lname(e.tag) == root_tag:
+                              obj = e
+                              break
+                      if obj is None:
+                          raise Exception('tag not found')
+                      p = props(obj)
+                      name = text(p, 'Name') or path.stem
+                      syn = synonym(p)
+                      register_type = text(p, 'RegisterType')
+                      periodicity = text(p, 'InformationRegisterPeriodicity') or text(p, 'Periodicity')
+                      write_mode = text(p, 'WriteMode')
+                      dims = items(obj, 'Dimension')
+                      res = items(obj, 'Resource')
+                      attrs = items(obj, 'Attribute')
+                      cat = contour(name, syn, dims, res, attrs)
+                      kind = storage_kind(obj_type, register_type, periodicity, write_mode)
+                      rows.append({'obj_type': obj_type, 'name': name, 'syn': syn, 'contour': cat, 'kind': kind, 'register_type': register_type, 'periodicity': periodicity, 'write_mode': write_mode, 'dims': dims, 'res': res, 'attrs': attrs, 'path': str(path), 'err': ''})
+                      for f_kind, arr in [('Измерение', dims), ('Ресурс', res), ('Реквизит', attrs)]:
+                          for f in arr:
+                              field_rows.append([obj_type, name, f_kind, f['name'], f['synonym'], f['type'], f['tooltip'], f['totals'], f['fill'], str(path)])
+                  except Exception as e:
+                      rows.append({'obj_type': obj_type, 'name': name, 'syn': '', 'contour': 'Ошибка разбора XML', 'kind': '', 'register_type': '', 'periodicity': '', 'write_mode': '', 'dims': [], 'res': [], 'attrs': [], 'path': str(path), 'err': str(e)})
+                  names.add(name)
+
+          refs = defaultdict(list)
+          bsl_files = [p for p in Path('.').rglob('*.bsl') if '.git' not in p.parts and 'REPO_ANALYSIS' not in p.parts]
+          patterns = [(n, re.compile(r'(Движения|РегистрыНакопления|РегистрыСведений)\.' + re.escape(n) + r'\b')) for n in sorted(names, key=len, reverse=True)]
+
+          def source_kind(path):
+              parts = path.parts
+              if len(parts) >= 2 and parts[0] in ('Documents','DataProcessors','CommonModules','Reports','ScheduledJobs','ExchangePlans','InformationRegisters','AccumulationRegisters'):
+                  return parts[0], parts[1]
+              return (parts[0] if parts else 'Код'), str(path)
+
+          for path in bsl_files:
               try:
-                root=ET.parse(path).getroot(); obj=None
-                for e in root.iter():
-                  if ln(e.tag)==tag: obj=e; break
-                if obj is None: raise Exception('tag not found')
-                p=props(obj); n=txt(p,'Name') or path.stem; s=syn(p); rt=txt(p,'RegisterType'); per=txt(p,'InformationRegisterPeriodicity') or txt(p,'Periodicity'); wm=txt(p,'WriteMode')
-                d=items(obj,'Dimension'); r=items(obj,'Resource'); a=items(obj,'Attribute'); c=contour(n,s,d,r,a); k=kind(ot,rt,per,wm)
-                rows.append({'ot':ot,'n':n,'s':s,'c':c,'k':k,'rt':rt,'per':per,'wm':wm,'d':d,'r':r,'a':a,'path':str(path),'err':''})
-                for typf,arr in [('Измерение',d),('Ресурс',r),('Реквизит',a)]:
-                  for f in arr: field_rows.append([ot,n,typf,f['n'],f['s'],f['t'],f['tip'],f['tot'],f['fill'],str(path)])
-              except Exception as e:
-                rows.append({'ot':ot,'n':n,'s':'','c':'Ошибка разбора XML','k':'','rt':'','per':'','wm':'','d':[],'r':[],'a':[],'path':str(path),'err':str(e)})
-              names.add(n)
-          refs=defaultdict(list)
-          pats=[(n,re.compile(r'(Движения|РегистрыНакопления|РегистрыСведений)\.'+re.escape(n)+r'\b')) for n in sorted(names,key=len,reverse=True)]
-          def sk(p):
-            parts=p.parts
-            if len(parts)>=2 and parts[0] in ('Documents','DataProcessors','CommonModules','Reports','ScheduledJobs','ExchangePlans','InformationRegisters','AccumulationRegisters'): return parts[0],parts[1]
-            return (parts[0] if parts else 'Код'),str(p)
-          bsl=[p for p in Path('.').rglob('*.bsl') if '.git' not in p.parts and 'REPO_ANALYSIS' not in p.parts]
-          for p in bsl:
-            try: tx=p.read_text(encoding='utf-8-sig',errors='ignore')
-            except Exception: continue
-            for n,pat in pats:
-              for m in pat.finditer(tx):
-                if len(refs[n])<80:
-                  root,obj=sk(p); line=tx.count('\n',0,m.start())+1; refs[n].append({'kind':root,'obj':obj,'path':str(p).lstrip('./'),'line':line,'pat':m.group(0)})
-          H=['Тип объекта','Имя регистра','Синоним','Контур учета','Тип хранения','Назначение','Что хранит','Ключевая аналитика','Ресурсы/значения','Реквизиты/признаки','Кто пишет','Подтвержденные источники','Когда меняется','Связи','Уверенность','XML путь','Ошибка разбора']
-          out=[]; src=[]
+                  tx = path.read_text(encoding='utf-8-sig', errors='ignore')
+              except Exception:
+                  continue
+              for name, pat in patterns:
+                  for m in pat.finditer(tx):
+                      if len(refs[name]) < 80:
+                          sk, obj = source_kind(path)
+                          refs[name].append({'kind': sk, 'object': obj, 'path': str(path).lstrip('./'), 'line': tx.count('\n', 0, m.start()) + 1, 'pattern': m.group(0)})
+
+          headers = ['Тип объекта','Имя регистра','Синоним','Контур учета','Тип хранения','Назначение','Что хранит','Ключевая аналитика','Ресурсы/значения','Реквизиты/признаки','Кто пишет','Подтвержденные источники','Когда меняется','Связи','Уверенность','XML путь','Ошибка разбора']
+          out = []
+          source_rows = []
           for r in rows:
-            ss=refs.get(r['n'],[]); base=(r['s'] or r['n']);
-            if r['ot']=='Регистр накопления': purpose=('Фиксирует остатки' if 'Остатки' in r['k'] else 'Фиксирует обороты')+f" в контуре '{r['c']}': {base}."
-            else: purpose=("Хранит историю сведений" if 'Периодические' in r['k'] else 'Хранит состояние/соответствие/служебные сведения')+f" в контуре '{r['c']}': {base}."
-            store=(('Аналитики: '+bf(r['d'],8)+'. ') if r['d'] else '')+(('Значения: '+bf(r['r'],8)+'. ') if r['r'] else '')+(('Признаки: '+bf(r['a'],6)+'.') if r['a'] else '')
-            who='; '.join(f"{Counter([x['kind'] for x in ss]).get(k,0)} {k}" for k in sorted(set(x['kind'] for x in ss))) if ss else 'прямые ссылки в BSL не найдены; нужен ручной просмотр косвенного механизма записи'
-            found='; '.join(f"{x['kind']}:{x['obj']}:{x['line']}" for x in ss[:15]) if ss else 'не найдено'
-            when='При проведении/отмене проведения документов или расчетных обработках.' if r['ot']=='Регистр накопления' else ('При изменении значения во времени/получении среза.' if 'Периодические' in r['k'] else 'При записи объекта, настройки, обмена или служебного механизма.')
-            links='см. контур учета и источники записи'; conf='Высокая' if ss and not r['err'] else ('Средняя' if not r['err'] else 'Низкая')
-            out.append([r['ot'],r['n'],r['s'],r['c'],r['k'],purpose,store,bf(r['d'],12),bf(r['r'],12),bf(r['a'],10),who,found,when,links,conf,r['path'],r['err']])
-            for x in ss: src.append([r['ot'],r['n'],x['kind'],x['obj'],x['path'],x['line'],x['pat']])
-          def write_csv(fn,headers,data):
-            with open(OUT/fn,'w',newline='',encoding='utf-8-sig') as f: w=csv.writer(f); w.writerow(headers); w.writerows(data)
-          write_csv('registers_full_analysis.csv',H,out); write_csv('registers_code_sources.csv',['Тип объекта','Имя регистра','Тип источника','Объект','Путь','Строка','Паттерн'],src); write_csv('registers_fields_reference.csv',['Тип объекта','Имя регистра','Вид поля','Поле','Синоним','Тип','Подсказка','В итогах','Проверка заполнения','XML путь'],field_rows)
-          wb=Workbook(); ws=wb.active; ws.title='Итоги'; cnt=Counter(x[0] for x in out); cc=Counter(x[3] for x in out)
-          for row in [['Показатель','Значение'],['Регистров накопления',cnt['Регистр накопления']],['Регистров сведений',cnt['Регистр сведений']],['Всего регистров',len(out)],['Ссылок в BSL',len(src)],['BSL файлов просмотрено',len(bsl)],['Сформировано UTC',datetime.now(timezone.utc).strftime('%F %T')],['GITHUB_RUN_ID',os.environ.get('GITHUB_RUN_ID','')]]: ws.append(row)
-          ws.append([]); ws.append(['Контур учета','Количество'])
-          for k,v in cc.most_common(): ws.append([k,v])
-          def sheet(name,headers,data):
-            sh=wb.create_sheet(name); sh.append(headers)
-            for row in data: sh.append(row)
-            return sh
-          sheet('Все регистры',H,out); sheet('Накопление',H,[x for x in out if x[0]=='Регистр накопления']); sheet('Сведения',H,[x for x in out if x[0]=='Регистр сведений']); sheet('Источники записи',['Тип объекта','Имя регистра','Тип источника','Объект','Путь','Строка','Паттерн'],src); sheet('Поля справочно',['Тип объекта','Имя регистра','Вид поля','Поле','Синоним','Тип','Подсказка','В итогах','Проверка заполнения','XML путь'],field_rows); sheet('Методика',['Раздел','Описание'],[['Цель','Понять учетную модель УТ через 104 регистра накопления и 838 регистров сведений.'],['Что важно','Не поля ради полей, а учетная роль: что хранит, остатки/обороты/сведения, кто пишет, когда меняется.'],['Код','Ищутся прямые ссылки Движения.<Регистр>, РегистрыНакопления.<Регистр>, РегистрыСведений.<Регистр>.'],['Ограничение','Если источник не найден, он может быть в косвенном общем механизме записи движений; строка не додумывается.']])
-          fill=PatternFill('solid',fgColor='1F4E78'); font=Font(color='FFFFFF',bold=True); side=Side(style='thin',color='D9E2F3'); bd=Border(left=side,right=side,top=side,bottom=side)
+              srcs = refs.get(r['name'], [])
+              base = r['syn'] or r['name']
+              if r['obj_type'] == 'Регистр накопления':
+                  purpose = ('Фиксирует остатки' if 'Остатки' in r['kind'] else 'Фиксирует обороты') + " в контуре '" + r['contour'] + "': " + base + '.'
+              else:
+                  purpose = ('Хранит историю сведений' if 'Периодические' in r['kind'] else 'Хранит состояние/соответствие/служебные сведения') + " в контуре '" + r['contour'] + "': " + base + '.'
+              stores = (('Аналитики: ' + brief(r['dims'], 8) + '. ') if r['dims'] else '') + (('Значения: ' + brief(r['res'], 8) + '. ') if r['res'] else '') + (('Признаки: ' + brief(r['attrs'], 6) + '.') if r['attrs'] else '')
+              who = '; '.join(str(Counter([x['kind'] for x in srcs])[k]) + ' ' + k for k in sorted(set(x['kind'] for x in srcs))) if srcs else 'прямые ссылки в BSL не найдены; нужен ручной просмотр косвенного механизма записи'
+              found = '; '.join(x['kind'] + ':' + x['object'] + ':' + str(x['line']) for x in srcs[:15]) if srcs else 'не найдено'
+              when = 'При проведении/отмене проведения документов или расчетных обработках.' if r['obj_type'] == 'Регистр накопления' else ('При изменении значения во времени/получении среза.' if 'Периодические' in r['kind'] else 'При записи объекта, настройки, обмена или служебного механизма.')
+              conf = 'Высокая' if srcs and not r['err'] else ('Средняя' if not r['err'] else 'Низкая')
+              out.append([r['obj_type'], r['name'], r['syn'], r['contour'], r['kind'], purpose, stores, brief(r['dims'], 12), brief(r['res'], 12), brief(r['attrs'], 10), who, found, when, 'см. контур учета и источники записи', conf, r['path'], r['err']])
+              for s in srcs:
+                  source_rows.append([r['obj_type'], r['name'], s['kind'], s['object'], s['path'], s['line'], s['pattern']])
+
+          def write_csv(filename, headers, data):
+              with open(OUT / filename, 'w', newline='', encoding='utf-8-sig') as f:
+                  w = csv.writer(f)
+                  w.writerow(headers)
+                  w.writerows(data)
+
+          write_csv('registers_full_analysis.csv', headers, out)
+          write_csv('registers_code_sources.csv', ['Тип объекта','Имя регистра','Тип источника','Объект','Путь','Строка','Паттерн'], source_rows)
+          write_csv('registers_fields_reference.csv', ['Тип объекта','Имя регистра','Вид поля','Поле','Синоним','Тип','Подсказка','В итогах','Проверка заполнения','XML путь'], field_rows)
+
+          wb = Workbook()
+          ws = wb.active
+          ws.title = 'Итоги'
+          cnt = Counter(x[0] for x in out)
+          cc = Counter(x[3] for x in out)
+          for row in [['Показатель','Значение'], ['Регистров накопления', cnt['Регистр накопления']], ['Регистров сведений', cnt['Регистр сведений']], ['Всего регистров', len(out)], ['Ссылок в BSL', len(source_rows)], ['BSL файлов просмотрено', len(bsl_files)], ['Сформировано UTC', datetime.now(timezone.utc).strftime('%F %T')], ['GITHUB_RUN_ID', os.environ.get('GITHUB_RUN_ID', '')]]:
+              ws.append(row)
+          ws.append([])
+          ws.append(['Контур учета','Количество'])
+          for k, v in cc.most_common():
+              ws.append([k, v])
+
+          def sheet(name, headers, data):
+              sh = wb.create_sheet(name)
+              sh.append(headers)
+              for row in data:
+                  sh.append(row)
+              return sh
+
+          sheet('Все регистры', headers, out)
+          sheet('Накопление', headers, [x for x in out if x[0] == 'Регистр накопления'])
+          sheet('Сведения', headers, [x for x in out if x[0] == 'Регистр сведений'])
+          sheet('Источники записи', ['Тип объекта','Имя регистра','Тип источника','Объект','Путь','Строка','Паттерн'], source_rows)
+          sheet('Поля справочно', ['Тип объекта','Имя регистра','Вид поля','Поле','Синоним','Тип','Подсказка','В итогах','Проверка заполнения','XML путь'], field_rows)
+          sheet('Методика', ['Раздел','Описание'], [['Цель','Понять учетную модель УТ через 104 регистра накопления и 838 регистров сведений.'], ['Что важно','Не поля ради полей, а учетная роль: что хранит, остатки/обороты/сведения, кто пишет, когда меняется.'], ['Код','Ищутся прямые ссылки Движения.<Регистр>, РегистрыНакопления.<Регистр>, РегистрыСведений.<Регистр>.'], ['Ограничение','Если источник не найден, он может быть в косвенном общем механизме записи движений; строка не додумывается.']])
+
+          fill = PatternFill('solid', fgColor='1F4E78')
+          font = Font(color='FFFFFF', bold=True)
+          side = Side(style='thin', color='D9E2F3')
+          border = Border(left=side, right=side, top=side, bottom=side)
           for sh in wb.worksheets:
-            sh.freeze_panes='A2'
-            for cell in sh[1]: cell.fill=fill; cell.font=font; cell.alignment=Alignment(horizontal='center',vertical='center',wrap_text=True)
-            for row in sh.iter_rows():
-              for cell in row: cell.border=bd; cell.alignment=Alignment(vertical='top',wrap_text=True)
-            for i in range(1,sh.max_column+1): sh.column_dimensions[get_column_letter(i)].width=40 if i in (6,7,11,12,13) else 22
-            if sh.max_row>1 and sh.max_column>1:
-              try:
-                tab=Table(displayName=re.sub('[^A-Za-z0-9]','',sh.title)[:20]+'Tbl', ref=f"A1:{get_column_letter(sh.max_column)}{sh.max_row}"); tab.tableStyleInfo=TableStyleInfo(name='TableStyleMedium2',showRowStripes=True); sh.add_table(tab)
-              except Exception: pass
-          wb.save(OUT/'ut_registers_analysis_full.xlsx')
-          with open(OUT/'latest_run.txt','w',encoding='utf-8') as f:
-            f.write(f"GITHUB_RUN_ID={os.environ.get('GITHUB_RUN_ID','')}\nACCUMULATION={cnt['Регистр накопления']}\nINFORMATION={cnt['Регистр сведений']}\nTOTAL={len(out)}\nCODE_REFS={len(src)}\n")
+              sh.freeze_panes = 'A2'
+              for cell in sh[1]:
+                  cell.fill = fill
+                  cell.font = font
+                  cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+              for row in sh.iter_rows():
+                  for cell in row:
+                      cell.border = border
+                      cell.alignment = Alignment(vertical='top', wrap_text=True)
+              for i in range(1, sh.max_column + 1):
+                  sh.column_dimensions[get_column_letter(i)].width = 42 if i in (6,7,11,12,13) else 24
+              if sh.max_row > 1 and sh.max_column > 1:
+                  try:
+                      tab = Table(displayName=re.sub('[^A-Za-z0-9]', '', sh.title)[:20] + 'Tbl', ref='A1:' + get_column_letter(sh.max_column) + str(sh.max_row))
+                      tab.tableStyleInfo = TableStyleInfo(name='TableStyleMedium2', showRowStripes=True)
+                      sh.add_table(tab)
+                  except Exception:
+                      pass
+          wb.save(OUT / 'ut_registers_analysis_full.xlsx')
+          with open(OUT / 'latest_run.txt', 'w', encoding='utf-8') as f:
+              f.write('GITHUB_RUN_ID=' + os.environ.get('GITHUB_RUN_ID', '') + '\n')
+              f.write('ACCUMULATION=' + str(cnt['Регистр накопления']) + '\n')
+              f.write('INFORMATION=' + str(cnt['Регистр сведений']) + '\n')
+              f.write('TOTAL=' + str(len(out)) + '\n')
+              f.write('CODE_REFS=' + str(len(source_rows)) + '\n')
+          if cnt['Регистр накопления'] != 104 or cnt['Регистр сведений'] != 838 or len(out) != 942:
+              raise SystemExit('Неверное количество регистров: ' + str(dict(cnt)) + ', total=' + str(len(out)))
           PY
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ut-registers-analysis-full
           path: REPO_ANALYSIS_FULL/*
+
       - name: Commit results
         shell: bash
         run: |
           git config user.name github-actions
           git config user.email github-actions@github.com
-          git add REPO_INDEX REPO_ANALYSIS_FULL
-          if git diff --cached --quiet; then echo "No changes"; else git commit -m "Полный анализ регистров УТ ${GITHUB_RUN_ID}" && git push; fi
+          git add REPO_ANALYSIS_FULL
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Полный анализ регистров УТ ${GITHUB_RUN_ID}"
+            git push
+          fi
