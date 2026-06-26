@@ -1,0 +1,25 @@
+# Временные файлы
+*.tmp
+*.bak
+*.old
+*.log
+
+# Windows
+Thumbs.db
+Desktop.ini
+
+# Кэш/мусор
+.cache/
+tmp/
+temp/
+
+# Бинарники 1С — не храним в Git
+*.1CD
+*.dt
+*.cf
+*.cfu
+
+# Архивы
+*.zip
+*.rar
+*.7z
