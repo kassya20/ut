@@ -27,10 +27,10 @@ jobs:
           rm -rf REPO_INDEX
           mkdir -p REPO_INDEX
 
-          # Полный список файлов без .git и без самого индекса.
           find . -type f \
             ! -path './.git/*' \
             ! -path './REPO_INDEX/*' \
+            ! -path './REPO_ANALYSIS/*' \
             ! -name 'REPO_INDEX.md' \
             ! -name 'REPO_INDEX_FULL.md' \
             | sed 's#^./##' \
@@ -38,7 +38,6 @@ jobs:
 
           total_files=$(wc -l < /tmp/repo_files.txt | tr -d ' ')
 
-          # Разбивка полного списка на части, чтобы индекс читался коннектором.
           split -l 1000 -d -a 4 /tmp/repo_files.txt REPO_INDEX/files_
           for f in REPO_INDEX/files_*; do
             mv "$f" "$f.txt"
@@ -65,17 +64,394 @@ jobs:
             cut -d/ -f1 /tmp/repo_files.txt | sort | uniq -c | sort -nr
           } > REPO_INDEX/SUMMARY.txt
 
-      - name: Commit index
+      - name: Install Python dependencies
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install openpyxl
+
+      - name: Analyze accumulation and information registers
+        shell: bash
+        run: |
+          set -e
+          python <<'PY'
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          from collections import Counter, defaultdict
+          from datetime import datetime, timezone
+          from openpyxl import Workbook
+          from openpyxl.styles import Font, PatternFill, Border, Side, Alignment
+          from openpyxl.utils import get_column_letter
+          from openpyxl.worksheet.table import Table, TableStyleInfo
+          from openpyxl.formatting.rule import FormulaRule
+          import csv
+          import re
+
+          OUT = Path('REPO_ANALYSIS')
+          OUT.mkdir(exist_ok=True)
+
+          NS = {
+              'v8': 'http://v8.1c.ru/8.1/data/core',
+              'xr': 'http://v8.1c.ru/8.3/xcf/readable',
+          }
+
+          def clean_text(value):
+              if value is None:
+                  return ''
+              return ' '.join(str(value).replace('\ufeff', '').split())
+
+          def local_name(tag):
+              return tag.split('}', 1)[-1] if '}' in tag else tag
+
+          def first_text(elem, names):
+              for n in names:
+                  found = elem.find('.//' + n)
+                  if found is not None and found.text is not None:
+                      return clean_text(found.text)
+              return ''
+
+          def direct_text(parent, child_name):
+              if parent is None:
+                  return ''
+              for child in parent:
+                  if local_name(child.tag) == child_name:
+                      return clean_text(child.text)
+              return ''
+
+          def get_synonym(props):
+              if props is None:
+                  return ''
+              for elem in props.iter():
+                  if local_name(elem.tag) == 'content' and elem.text:
+                      return clean_text(elem.text)
+              return ''
+
+          def get_properties(obj):
+              for child in obj:
+                  if local_name(child.tag) == 'Properties':
+                      return child
+              return None
+
+          def get_child_objects(obj):
+              for child in obj:
+                  if local_name(child.tag) == 'ChildObjects':
+                      return child
+              return None
+
+          def get_type_text(props):
+              if props is None:
+                  return ''
+              type_node = None
+              for child in props:
+                  if local_name(child.tag) == 'Type':
+                      type_node = child
+                      break
+              if type_node is None:
+                  return ''
+              parts = []
+              for e in type_node.iter():
+                  ln = local_name(e.tag)
+                  if ln in ('Type',):
+                      continue
+                  if e.text and clean_text(e.text):
+                      parts.append(clean_text(e.text))
+              return '; '.join(dict.fromkeys(parts))
+
+          def child_items(obj, wanted_tag):
+              child_objects = get_child_objects(obj)
+              if child_objects is None:
+                  return []
+              result = []
+              for item in child_objects:
+                  if local_name(item.tag) == wanted_tag:
+                      props = get_properties(item)
+                      name = direct_text(props, 'Name')
+                      result.append({
+                          'name': name,
+                          'synonym': get_synonym(props),
+                          'type': get_type_text(props),
+                          'fill_checking': first_text(props, ['.//{http://v8.1c.ru/8.3/xcf/readable}FillChecking', './/FillChecking']),
+                          'use_in_totals': first_text(props, ['.//UseInTotals']),
+                          'indexing': first_text(props, ['.//Indexing']),
+                      })
+              return result
+
+          def classify_register(name, synonym, dims, resources):
+              text = (name + ' ' + synonym + ' ' + ' '.join(d['name'] for d in dims) + ' ' + ' '.join(r['name'] for r in resources)).lower()
+              rules = [
+                  ('Склад / товары / остатки', ['склад', 'товар', 'номенклатур', 'остат', 'сер', 'характеристик', 'ячейк', 'упаков']),
+                  ('Продажи / выручка / себестоимость', ['продаж', 'выруч', 'себестоим', 'клиент', 'реализац']),
+                  ('Закупки / поставщики', ['закуп', 'поставщ', 'поступлен']),
+                  ('Денежные средства', ['денеж', 'деньг', 'касс', 'банк', 'эквайр', 'платеж']),
+                  ('Взаиморасчеты / контрагенты', ['расчет', 'задолж', 'аванс', 'контрагент', 'партнер', 'договор']),
+                  ('Цены / скидки / условия', ['цен', 'скид', 'нацен', 'акци', 'прайс', 'соглашен']),
+                  ('Налоги / НДС / акцизы', ['ндс', 'акциз', 'налог']),
+                  ('Заказы / обеспечение / резервы', ['заказ', 'резерв', 'обеспеч', 'потребност', 'отгрузк', 'поступлен']),
+                  ('Интеграции / обмены', ['обмен', 'внешн', 'идентификатор', 'синхрон', 'очеред']),
+                  ('Настройки / состояния / служебные сведения', ['настрой', 'состояни', 'статус', 'верс', 'параметр']),
+              ]
+              matched = []
+              for category, words in rules:
+                  if any(w in text for w in words):
+                      matched.append(category)
+              return '; '.join(matched) if matched else 'Прочее / требуется ручная классификация'
+
+          def infer_purpose(obj_type, name, synonym, register_type, periodicity, dims, resources, attrs):
+              fields = []
+              if register_type == 'Balance':
+                  fields.append('хранит состояние/остатки')
+              elif register_type == 'Turnovers':
+                  fields.append('хранит обороты/движения')
+              elif obj_type == 'Регистр сведений':
+                  if periodicity and periodicity != 'Nonperiodic':
+                      fields.append('хранит периодические сведения')
+                  else:
+                      fields.append('хранит непериодические сведения')
+              if resources:
+                  fields.append('ресурсы: ' + ', '.join(r['name'] for r in resources[:6]))
+              if dims:
+                  fields.append('аналитики: ' + ', '.join(d['name'] for d in dims[:8]))
+              return '; '.join(fields)
+
+          def analysis_notes(obj_type, name, register_type, periodicity, dims, resources, attrs):
+              notes = []
+              if obj_type == 'Регистр накопления':
+                  if register_type == 'Balance':
+                      notes.append('анализировать остатки по полной аналитике регистра')
+                  elif register_type == 'Turnovers':
+                      notes.append('анализировать движения и обороты по полной аналитике регистра')
+                  else:
+                      notes.append('уточнить тип накопления по XML')
+              else:
+                  if periodicity and periodicity != 'Nonperiodic':
+                      notes.append('проверять актуальные срезы и историю значений')
+                  else:
+                      notes.append('проверять уникальность ключа измерений и согласованность сведений')
+              if dims:
+                  notes.append('ключ анализа: ' + ' + '.join(d['name'] for d in dims[:10]))
+              if len(dims) > 10:
+                  notes.append(f'еще аналитик: {len(dims)-10}')
+              return '; '.join(notes)
+
+          def parse_register_file(path, obj_type):
+              try:
+                  root = ET.parse(path).getroot()
+              except Exception as e:
+                  return {'path': str(path), 'object_type': obj_type, 'parse_error': str(e)}
+              obj = None
+              wanted = 'AccumulationRegister' if obj_type == 'Регистр накопления' else 'InformationRegister'
+              for elem in root.iter():
+                  if local_name(elem.tag) == wanted:
+                      obj = elem
+                      break
+              if obj is None:
+                  return {'path': str(path), 'object_type': obj_type, 'parse_error': 'object tag not found'}
+              props = get_properties(obj)
+              name = direct_text(props, 'Name')
+              synonym = get_synonym(props)
+              comment = direct_text(props, 'Comment')
+              register_type = direct_text(props, 'RegisterType')
+              periodicity = direct_text(props, 'Periodicity')
+              write_mode = direct_text(props, 'WriteMode')
+              dims = child_items(obj, 'Dimension')
+              resources = child_items(obj, 'Resource')
+              attrs = child_items(obj, 'Attribute')
+              base_dir = path.with_suffix('')
+              manager_module = base_dir / 'Ext' / 'ManagerModule.bsl'
+              recordset_module = base_dir / 'Ext' / 'RecordSetModule.bsl'
+              forms_dir = base_dir / 'Forms'
+              additional_indexes = base_dir / 'Ext' / 'AdditionalIndexes.xml'
+              category = classify_register(name, synonym, dims, resources)
+              return {
+                  'path': str(path).replace('\\', '/'),
+                  'object_type': obj_type,
+                  'name': name,
+                  'synonym': synonym,
+                  'comment': comment,
+                  'register_type': register_type,
+                  'periodicity': periodicity,
+                  'write_mode': write_mode,
+                  'dimensions_count': len(dims),
+                  'resources_count': len(resources),
+                  'attributes_count': len(attrs),
+                  'dimensions': ', '.join(d['name'] for d in dims),
+                  'resources': ', '.join(r['name'] for r in resources),
+                  'attributes': ', '.join(a['name'] for a in attrs),
+                  'category': category,
+                  'purpose': infer_purpose(obj_type, name, synonym, register_type, periodicity, dims, resources, attrs),
+                  'analysis_notes': analysis_notes(obj_type, name, register_type, periodicity, dims, resources, attrs),
+                  'manager_module': 'есть' if manager_module.exists() else 'нет',
+                  'recordset_module': 'есть' if recordset_module.exists() else 'нет',
+                  'forms': len(list(forms_dir.glob('*.xml'))) if forms_dir.exists() else 0,
+                  'additional_indexes': 'есть' if additional_indexes.exists() else 'нет',
+                  'parse_error': '',
+                  '_dims': dims,
+                  '_resources': resources,
+                  '_attrs': attrs,
+              }
+
+          rows = []
+          for base, obj_type in [(Path('AccumulationRegisters'), 'Регистр накопления'), (Path('InformationRegisters'), 'Регистр сведений')]:
+              if base.exists():
+                  for path in sorted(base.glob('*.xml')):
+                      rows.append(parse_register_file(path, obj_type))
+
+          # CSV summary
+          summary_cols = ['object_type','name','synonym','category','path','register_type','periodicity','write_mode','dimensions_count','resources_count','attributes_count','dimensions','resources','attributes','purpose','analysis_notes','manager_module','recordset_module','forms','additional_indexes','parse_error']
+          with open(OUT / 'registers_summary.csv', 'w', newline='', encoding='utf-8-sig') as f:
+              w = csv.DictWriter(f, fieldnames=summary_cols)
+              w.writeheader()
+              for r in rows:
+                  w.writerow({k: r.get(k, '') for k in summary_cols})
+
+          field_cols = ['object_type','register_name','register_synonym','field_kind','field_name','field_synonym','field_type','fill_checking','use_in_totals','indexing','register_path']
+          with open(OUT / 'registers_fields.csv', 'w', newline='', encoding='utf-8-sig') as f:
+              w = csv.DictWriter(f, fieldnames=field_cols)
+              w.writeheader()
+              for r in rows:
+                  for kind, key in [('Измерение','_dims'),('Ресурс','_resources'),('Реквизит','_attrs')]:
+                      for fld in r.get(key, []):
+                          w.writerow({
+                              'object_type': r.get('object_type',''),
+                              'register_name': r.get('name',''),
+                              'register_synonym': r.get('synonym',''),
+                              'field_kind': kind,
+                              'field_name': fld.get('name',''),
+                              'field_synonym': fld.get('synonym',''),
+                              'field_type': fld.get('type',''),
+                              'fill_checking': fld.get('fill_checking',''),
+                              'use_in_totals': fld.get('use_in_totals',''),
+                              'indexing': fld.get('indexing',''),
+                              'register_path': r.get('path',''),
+                          })
+
+          # Excel
+          wb = Workbook()
+          ws = wb.active
+          ws.title = 'Итоги'
+          total = len(rows)
+          acc = sum(1 for r in rows if r.get('object_type') == 'Регистр накопления')
+          inf = sum(1 for r in rows if r.get('object_type') == 'Регистр сведений')
+          errors = sum(1 for r in rows if r.get('parse_error'))
+          category_counter = Counter(r.get('category') or 'Не определено' for r in rows)
+          type_counter = Counter((r.get('object_type'), r.get('register_type') or r.get('periodicity') or 'не заполнено') for r in rows)
+          ws.append(['Анализ регистров УТ'])
+          ws.append(['Сформировано', datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')])
+          ws.append(['Всего регистров', total])
+          ws.append(['Регистры накопления', acc])
+          ws.append(['Регистры сведений', inf])
+          ws.append(['Ошибки разбора XML', errors])
+          ws.append([])
+          ws.append(['Группа/назначение', 'Количество'])
+          for k, v in category_counter.most_common():
+              ws.append([k, v])
+          ws.append([])
+          ws.append(['Тип/периодичность', 'Количество'])
+          for (ot, rt), v in sorted(type_counter.items()):
+              ws.append([f'{ot}: {rt}', v])
+
+          ws2 = wb.create_sheet('Реестр регистров')
+          ws2.append(['Тип объекта','Имя','Синоним','Группа/назначение','Путь XML','Тип накопления','Периодичность','Режим записи','Измерений','Ресурсов','Реквизитов','Измерения','Ресурсы','Реквизиты','Назначение по структуре','Как анализировать','Модуль менеджера','Модуль набора','Формы','Индексы','Ошибка разбора'])
+          for r in rows:
+              ws2.append([r.get(k,'') for k in ['object_type','name','synonym','category','path','register_type','periodicity','write_mode','dimensions_count','resources_count','attributes_count','dimensions','resources','attributes','purpose','analysis_notes','manager_module','recordset_module','forms','additional_indexes','parse_error']])
+
+          ws3 = wb.create_sheet('Поля регистров')
+          ws3.append(['Тип объекта','Регистр','Синоним регистра','Вид поля','Поле','Синоним поля','Тип поля','Проверка заполнения','Используется в итогах','Индексирование','Путь XML'])
+          for r in rows:
+              for kind, key in [('Измерение','_dims'),('Ресурс','_resources'),('Реквизит','_attrs')]:
+                  for fld in r.get(key, []):
+                      ws3.append([r.get('object_type',''), r.get('name',''), r.get('synonym',''), kind, fld.get('name',''), fld.get('synonym',''), fld.get('type',''), fld.get('fill_checking',''), fld.get('use_in_totals',''), fld.get('indexing',''), r.get('path','')])
+
+          ws4 = wb.create_sheet('Методика')
+          method_rows = [
+              ['Слой', 'Что изучается', 'Что сохраняется'],
+              ['0. Карта регистров', 'Список регистров накопления и сведений, тип, путь, модули, формы.', 'Реестр регистров'],
+              ['1. Структура регистра', 'Измерения, ресурсы, реквизиты, периодичность/вид накопления.', 'Поля регистров'],
+              ['2. Назначение по структуре', 'Грубая бизнес-классификация по имени, синониму, аналитикам и ресурсам.', 'Группа/назначение, Назначение по структуре'],
+              ['3. Граница этапа', 'Проверки не формируются. Настройки программы и учетные политики не анализируются.', 'Только изучение устройства регистров'],
+          ]
+          for row in method_rows:
+              ws4.append(row)
+
+          # Formatting
+          header_fill = PatternFill('solid', fgColor='1F4E78')
+          header_font = Font(color='FFFFFF', bold=True)
+          title_font = Font(bold=True, size=14, color='1F4E78')
+          thin = Side(style='thin', color='D9E2F3')
+          border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+          for sheet in wb.worksheets:
+              sheet.freeze_panes = 'A2'
+              for cell in sheet[1]:
+                  cell.fill = header_fill
+                  cell.font = header_font
+                  cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+              for row in sheet.iter_rows():
+                  for cell in row:
+                      cell.border = border
+                      cell.alignment = Alignment(vertical='top', wrap_text=True)
+              for col_idx, col in enumerate(sheet.columns, start=1):
+                  max_len = 0
+                  for cell in col:
+                      if cell.value is not None:
+                          max_len = max(max_len, min(len(str(cell.value)), 80))
+                  width = min(max(max_len + 2, 10), 45)
+                  if sheet.title in ('Реестр регистров','Поля регистров') and col_idx in (12,13,14,15,16,7):
+                      width = 38
+                  sheet.column_dimensions[get_column_letter(col_idx)].width = width
+              sheet.row_dimensions[1].height = 28
+
+          ws['A1'].font = title_font
+          ws['A1'].fill = PatternFill('solid', fgColor='FFFFFF')
+          ws['A1'].border = Border()
+
+          # Tables
+          def add_table(sheet, name):
+              if sheet.max_row >= 2 and sheet.max_column >= 2:
+                  ref = f'A1:{get_column_letter(sheet.max_column)}{sheet.max_row}'
+                  tab = Table(displayName=name, ref=ref)
+                  style = TableStyleInfo(name='TableStyleMedium2', showFirstColumn=False, showLastColumn=False, showRowStripes=True, showColumnStripes=False)
+                  tab.tableStyleInfo = style
+                  sheet.add_table(tab)
+          add_table(ws2, 'RegistersTable')
+          add_table(ws3, 'FieldsTable')
+          add_table(ws4, 'MethodTable')
+
+          # Highlight parse errors
+          if ws2.max_row > 1:
+              err_col = ws2.max_column
+              col_letter = get_column_letter(err_col)
+              ws2.conditional_formatting.add(f'A2:{col_letter}{ws2.max_row}', FormulaRule(formula=[f'${col_letter}2<>""'], fill=PatternFill('solid', fgColor='F4CCCC')))
+
+          xlsx_path = OUT / 'registers_analysis.xlsx'
+          wb.save(xlsx_path)
+
+          # Markdown summary
+          with open(OUT / 'registers_analysis_summary.md', 'w', encoding='utf-8') as f:
+              f.write('# Анализ регистров\n\n')
+              f.write(f'Сформировано: {datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")}\n\n')
+              f.write(f'- Всего регистров: {total}\n')
+              f.write(f'- Регистров накопления: {acc}\n')
+              f.write(f'- Регистров сведений: {inf}\n')
+              f.write(f'- Ошибок разбора XML: {errors}\n\n')
+              f.write('## Файлы\n\n')
+              f.write('- REPO_ANALYSIS/registers_analysis.xlsx\n')
+              f.write('- REPO_ANALYSIS/registers_summary.csv\n')
+              f.write('- REPO_ANALYSIS/registers_fields.csv\n')
+              f.write('- REPO_ANALYSIS/registers_analysis_summary.md\n')
+          PY
+
+      - name: Commit index and register analysis
         shell: bash
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions@github.com"
 
-          git add REPO_INDEX .github/workflows/build-repo-index.yml
+          git add REPO_INDEX REPO_ANALYSIS .github/workflows/build-repo-index.yml
 
           if git diff --cached --quiet; then
             echo "No changes"
           else
-            git commit -m "Обновлен индекс файлов базы"
+            git commit -m "Обновлен индекс и анализ регистров базы"
             git push
           fi
