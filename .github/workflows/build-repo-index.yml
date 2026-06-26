@@ -1,0 +1,81 @@
+name: Build repo index
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/build-repo-index.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  build-index:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Build chunked repository index
+        shell: bash
+        run: |
+          set -e
+
+          rm -rf REPO_INDEX
+          mkdir -p REPO_INDEX
+
+          # Полный список файлов без .git и без самого индекса.
+          find . -type f \
+            ! -path './.git/*' \
+            ! -path './REPO_INDEX/*' \
+            ! -name 'REPO_INDEX.md' \
+            ! -name 'REPO_INDEX_FULL.md' \
+            | sed 's#^./##' \
+            | sort > /tmp/repo_files.txt
+
+          total_files=$(wc -l < /tmp/repo_files.txt | tr -d ' ')
+
+          # Разбивка полного списка на части, чтобы индекс читался коннектором.
+          split -l 1000 -d -a 4 /tmp/repo_files.txt REPO_INDEX/files_
+          for f in REPO_INDEX/files_*; do
+            mv "$f" "$f.txt"
+          done
+
+          {
+            echo '# CONFIG_AUDIT_INDEX'
+            echo
+            echo 'Индекс файлов выгрузки базы УТ.'
+            echo
+            echo "Сформировано GitHub Actions: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+            echo
+            echo "Всего файлов: ${total_files}"
+            echo
+            echo '## Части индекса'
+            echo
+            for f in REPO_INDEX/files_*.txt; do
+              count=$(wc -l < "$f" | tr -d ' ')
+              echo "- ${f} — ${count} файлов"
+            done
+            echo
+            echo '## Быстрые группы верхнего уровня'
+            echo
+            cut -d/ -f1 /tmp/repo_files.txt | sort | uniq -c | sort -nr
+          } > REPO_INDEX/SUMMARY.txt
+
+      - name: Commit index
+        shell: bash
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions@github.com"
+
+          git add REPO_INDEX .github/workflows/build-repo-index.yml
+
+          if git diff --cached --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Обновлен индекс файлов базы"
+            git push
+          fi
